@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  encyclopedia-agent:
+    build: .
+    container_name: encyclopedia-agent
+    env_file:
+      - .env
+    volumes:
+      - ./output:/output
+    environment:
+      - api_key=${api_key}
+      - folder_id=${folder_id}
+    command: python encyclopedia_agent.py --path /output/encyclopedia --n 3 --m 3
