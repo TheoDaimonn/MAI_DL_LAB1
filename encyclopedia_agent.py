@@ -1,17 +1,22 @@
 import os
 import json
-import re
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional, Any
+from pathlib import Path
+from typing import Optional, Any, ClassVar, Dict, List
+
 from pydantic import BaseModel, Field
 from openai import OpenAI
 from dotenv import load_dotenv
 
 
-def create_client():
+def create_client() -> OpenAI:
     load_dotenv()
-    folder_id = os.environ["folder_id"]
-    api_key = os.environ["api_key"]
+    folder_id = os.environ.get("folder_id")
+    api_key = os.environ.get("api_key")
+    if not folder_id or not api_key:
+        missing = [k for k, v in {"folder_id": folder_id, "api_key": api_key}.items() if not v]
+        raise ValueError(f"Missing env vars: {', '.join(missing)}")
     return OpenAI(
         base_url="https://ai.api.cloud.yandex.net/v1",
         api_key=api_key,
@@ -19,9 +24,11 @@ def create_client():
     )
 
 
-def get_model_uri(folder_id: str = None) -> str:
-    if folder_id is None:
+def get_model_uri(folder_id: Optional[str] = None) -> str:
+    if not folder_id:
         folder_id = os.environ.get("folder_id")
+    if not folder_id:
+        raise ValueError("folder_id is required to build model URI")
     return f"gpt://{folder_id}/yandexgpt/latest"
 
 
@@ -30,14 +37,14 @@ def normalize_path(path: str) -> str:
     path = path.replace("\\", "/")
     while "//" in path:
         path = path.replace("//", "/")
-    return path.rstrip("/")
+    return str(Path(path)).rstrip("/")
 
 
+@dataclass
 class Memory:
-    def __init__(self):
-        self.entries = []
+    entries: List[Dict[str, Any]] = field(default_factory=list)
 
-    def add(self, entry_type: str, content: str, metadata: Optional[dict] = None):
+    def add(self, entry_type: str, content: str, metadata: Optional[dict] = None) -> None:
         self.entries.append(
             {
                 "type": entry_type,
@@ -73,14 +80,26 @@ class Memory:
 memory = Memory()
 
 
-class Mkdir(BaseModel):
+class ToolBase(BaseModel):
+    memory: ClassVar[Memory] = memory
+
+    @classmethod
+    def set_memory(cls, mem: Memory) -> None:
+        cls.memory = mem
+
+    def _add_memory(self, entry_type: str, content: str, metadata: Optional[dict] = None) -> None:
+        if self.memory:
+            self.memory.add(entry_type, content, metadata)
+
+
+class Mkdir(ToolBase):
     path: str = Field(description="Путь для создания директории")
 
     def process(self, session_id: str) -> str:
         try:
             clean_path = normalize_path(self.path)
             os.makedirs(clean_path, exist_ok=True)
-            memory.add(
+            self._add_memory(
                 "directory_created", f"Создана: {clean_path}", {"path": clean_path}
             )
             return f"OK: {clean_path}"
@@ -88,7 +107,7 @@ class Mkdir(BaseModel):
             return f"ERROR: {e}"
 
 
-class Grep(BaseModel):
+class Grep(ToolBase):
     pattern: str = Field(description="Паттерн для поиска")
     path: str = Field(description="Путь к файлу")
 
@@ -105,7 +124,7 @@ class Grep(BaseModel):
                 if self.pattern.lower() in line.lower()
             ]
             if matches:
-                memory.add(
+                self._add_memory(
                     "search_found",
                     f"Найдено: {len(matches)}",
                     {"pattern": self.pattern},
@@ -116,7 +135,7 @@ class Grep(BaseModel):
             return f"ERROR: {e}"
 
 
-class WriteArticle(BaseModel):
+class WriteArticle(ToolBase):
     topic: str = Field(description="Тема")
     subtopic: str = Field(description="Статья")
     content: str = Field(description="Содержание")
@@ -129,6 +148,7 @@ class WriteArticle(BaseModel):
                 clean_path = clean_path + ".md"
             os.makedirs(os.path.dirname(clean_path), exist_ok=True)
 
+            created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             md = f"""# {self.subtopic}
 
 **Раздел:** {self.topic}
@@ -140,11 +160,13 @@ class WriteArticle(BaseModel):
 ---
 
 *Энциклопедия для детей*
+
+*Дата создания: {created_at}*
 """
             with open(clean_path, "w", encoding="utf-8") as f:
                 f.write(md)
 
-            memory.add(
+            self._add_memory(
                 "article_created",
                 self.subtopic,
                 {"topic": self.topic, "path": clean_path},
@@ -170,8 +192,8 @@ class Agent:
         self.tool_choice = tool_choice
         self.verbose = verbose
 
-        self.tool_map = {}
-        self.tools_schema = []
+        self.tool_map: Dict[str, type] = {}
+        self.tools_schema: List[Dict[str, Any]] = []
 
         for tool in tools or []:
             if isinstance(tool, type) and issubclass(tool, BaseModel):
@@ -185,7 +207,7 @@ class Agent:
                     }
                 )
 
-        self.user_sessions = {}
+        self.user_sessions: Dict[str, Dict[str, Any]] = {}
 
     def _log(self, msg):
         if self.verbose:
@@ -205,7 +227,8 @@ class Agent:
             input=message,
         )
 
-        for iteration in range(30):
+        max_iters = 30
+        for iteration in range(max_iters):
             tool_calls = [item for item in res.output if item.type == "function_call"]
 
             if not tool_calls:
@@ -213,27 +236,36 @@ class Agent:
 
             outputs = []
             for call in tool_calls:
-                if call.name in self.tool_map:
-                    self._log(
-                        f" {call.name}({call.arguments[:80] if call.arguments else ''}...)"
-                    )
-                    try:
-                        fn = self.tool_map[call.name]
-                        obj = (
-                            fn.model_validate(json.loads(call.arguments))
-                            if call.arguments
-                            else fn()
-                        )
-                        result = obj.process(session_id)
-                    except Exception as e:
-                        result = f"ERROR: {e}"
+                if call.name not in self.tool_map:
                     outputs.append(
                         {
                             "type": "function_call_output",
                             "call_id": call.call_id,
-                            "output": result,
+                            "output": f"ERROR: Unknown tool {call.name}",
                         }
                     )
+                    continue
+
+                self._log(
+                    f" {call.name}({call.arguments[:80] if call.arguments else ''}...)"
+                )
+                try:
+                    fn = self.tool_map[call.name]
+                    if call.arguments:
+                        payload = json.loads(call.arguments)
+                        obj = fn.model_validate(payload)
+                    else:
+                        obj = fn()
+                    result = obj.process(session_id)
+                except Exception as e:
+                    result = f"ERROR: {e}"
+                outputs.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": call.call_id,
+                        "output": result,
+                    }
+                )
 
             if outputs:
                 # После выполнения - проси модель продолжить
@@ -283,6 +315,10 @@ WriteArticle(topic="Космос", subtopic="Звезды", content="...", filep
 - НЕ останавливайся после директорий"""
 
     tools = [Mkdir, Grep, WriteArticle]
+
+    for tool in tools:
+        if isinstance(tool, type) and issubclass(tool, ToolBase):
+            tool.set_memory(memory)
 
     agent = Agent(
         client=client,
