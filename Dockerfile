@@ -9,4 +9,4 @@ COPY . .
 
 ENV PYTHONUNBUFFERED=1
 
-CMD ["python", "encyclopedia_agent.py", "--path", "/output/encyclopedia", "--n", "3", "--m", "3"]
+CMD ["python", "-m", "encyclopedia", "--path", "/output/encyclopedia", "--n", "3", "--m", "3"]

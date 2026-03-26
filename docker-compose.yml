@@ -11,4 +11,4 @@ services:
     environment:
       - api_key=${api_key}
       - folder_id=${folder_id}
-    command: python encyclopedia_agent.py --path /output/encyclopedia --n 3 --m 3
+    command: python -m encyclopedia --path /output/encyclopedia --n 3 --m 3
